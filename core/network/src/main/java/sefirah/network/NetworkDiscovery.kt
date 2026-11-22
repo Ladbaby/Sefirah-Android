@@ -22,6 +22,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,12 +39,13 @@ import sefirah.domain.interfaces.DeviceManager
 import sefirah.domain.interfaces.NetworkManager
 import sefirah.domain.interfaces.PreferencesRepository
 import sefirah.domain.interfaces.SocketFactory
-import sefirah.domain.model.AddressEntry
 import sefirah.domain.model.ConnectionDetails
 import sefirah.domain.model.DiscoveredDevice
 import sefirah.domain.model.PairedDevice
 import sefirah.domain.model.UdpBroadcast
+import sefirah.domain.util.AddressUtils
 import sefirah.domain.util.MessageSerializer
+import sefirah.network.util.NetworkHelper
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.properties.Delegates
@@ -61,6 +63,7 @@ class NetworkDiscovery @Inject constructor(
     private lateinit var connectivityManager: ConnectivityManager
     private var isNetworkCallbackRegistered = false
     private var discoveryJob: Job? = null
+    private var rediscoveryJob: Job? = null
     private var udpSocket: BoundDatagramSocket? = null
     private var lastBroadcastTime: Long = 0
     private lateinit var udpBroadcast: UdpBroadcast
@@ -70,7 +73,10 @@ class NetworkDiscovery @Inject constructor(
     private val scope = CoroutineScope(Dispatchers.IO) + SupervisorJob()
     private var udpPort: Int = 5149
 
-    private var trustAllNetworks : Boolean = true
+    private var trustAllNetworks: Boolean = true
+
+    /** Networks the platform currently reports as available; used to avoid premature teardown. */
+    private val activeNetworks = mutableSetOf<Network>()
 
     private val _currentWifiSsid = MutableStateFlow<String?>(null)
     val currentWifiSsid: StateFlow<String?> = _currentWifiSsid.asStateFlow()
@@ -84,20 +90,39 @@ class NetworkDiscovery @Inject constructor(
             deviceId = localDevice.deviceId,
             deviceName = localDevice.deviceName,
         )
-        udpBroadcastMessage = MessageSerializer.serialize(udpBroadcast) ?: throw Exception("Failed to serialize UDP broadcast")
+        udpBroadcastMessage = MessageSerializer.serialize(udpBroadcast)
+            ?: throw Exception("Failed to serialize UDP broadcast")
+
+        // The network callback must stay registered in both trust modes. It is the only reliable
+        // signal for "the phone moved to another network", which is exactly when a reconnect is
+        // needed. The trust setting only decides whether discovery actually runs.
+        register()
 
         preferencesRepository.readTrustAllNetworks().collectLatest { trustAllNetworks ->
             this.trustAllNetworks = trustAllNetworks
-            if (this.trustAllNetworks) {
-                // If trust all networks is enabled, start all discovery services
-                startDiscovery()
-                unregister()
-            } else {
-                // If trust all networks is disabled, stop discovery and start listening to network changes
-                stopDiscovery()
-                register()
-            }
+            refreshWifiSsid()
+            applyTrustPolicy(startIfAllowed = true)
         }
+    }
+
+    /**
+     * Starts or stops discovery according to the trust setting and the current SSID.
+     *
+     * Discovery is also allowed whenever the location permission is missing, because the SSID
+     * cannot be read without it and refusing to discover would make the app unusable.
+     *
+     * @return true when discovery is allowed on the current network.
+     */
+    private suspend fun applyTrustPolicy(startIfAllowed: Boolean): Boolean {
+        val allowed = trustAllNetworks || !checkLocationPermissions(context) ||
+            _currentWifiSsid.value?.let { appRepository.getNetwork(it) != null } == true
+
+        if (allowed) {
+            if (startIfAllowed) startDiscovery()
+        } else {
+            stopDiscovery()
+        }
+        return allowed
     }
 
     fun startDiscovery() {
@@ -107,18 +132,19 @@ class NetworkDiscovery @Inject constructor(
         discoveryJob = scope.launch {
             try {
                 nsdService.advertiseService(udpBroadcast, tcpServerPort)
-                if (udpSocket == null) {
+                if (udpSocket == null || udpSocket?.isClosed == true) {
                     udpSocket = socketFactory.udpSocket(udpPort)
                 }
 
                 launch { startDeviceListener() }
                 launch { startNSDDiscovery() }
 
-                broadcastDevice()
+                broadcastDevice(force = true)
             } catch (e: Exception) {
                 Log.e(TAG, "Error starting discovery", e)
             }
         }
+        startPeriodicRediscovery()
     }
 
     private fun stopDiscovery() {
@@ -127,6 +153,8 @@ class NetworkDiscovery @Inject constructor(
             Log.d(TAG, "Stopping discovery")
             discoveryJob?.cancel()
             discoveryJob = null
+            rediscoveryJob?.cancel()
+            rediscoveryJob = null
             udpSocket?.close()
             udpSocket = null
             nsdService.stopAdvertisingService()
@@ -136,28 +164,55 @@ class NetworkDiscovery @Inject constructor(
         }
     }
 
-    fun register() {
-        if (!checkLocationPermissions(context) || trustAllNetworks) {
-            startDiscovery()
-            return
+    /**
+     * Tears discovery down and brings it back up. mDNS subscriptions and the bound UDP socket both
+     * go stale when the underlying interface changes, and the platform will not recover them on its
+     * own, so a network change has to rebuild them.
+     */
+    private suspend fun restartDiscovery() {
+        Log.d(TAG, "Restarting discovery after network change")
+        stopDiscovery()
+        delay(NETWORK_CHANGE_SETTLE_MS)
+        startDiscovery()
+    }
+
+    /**
+     * Periodically re-announces this device and recycles the mDNS subscription while disconnected.
+     *
+     * Both discovery mechanisms are otherwise purely event driven, so a missed announcement (or a
+     * dead NSD subscription) strands the app until the user manually reconnects.
+     */
+    private fun startPeriodicRediscovery() {
+        if (rediscoveryJob?.isActive == true) return
+        rediscoveryJob = scope.launch {
+            while (isActive) {
+                delay(REDISCOVERY_INTERVAL_MS)
+                if (discoveryJob?.isActive != true) continue
+                if (hasConnectedDevice()) continue
+
+                Log.d(TAG, "Periodic rediscovery tick")
+                broadcastDevice(force = true)
+                nsdService.restartDiscovery()
+            }
         }
-        if (isNetworkCallbackRegistered) unregister()
+    }
+
+    private fun hasConnectedDevice(): Boolean =
+        deviceManager.pairedDevices.value.any { it.connectionState.isConnectedOrConnecting }
+
+    fun register() {
+        if (isNetworkCallbackRegistered) return
         Log.d(TAG, "Registering network callback")
 
         connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
 
-        // update the current WiFi ssid if android version is less than 13
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val connectionInfo = wifiManager.connectionInfo
+        refreshWifiSsid()
 
-            if (connectionInfo.supplicantState == SupplicantState.COMPLETED) {
-                updateWifiSsid(connectionInfo.ssid)
-            }
-        }
-
+        // Watch every local transport, not only Wi-Fi: disconnecting Wi-Fi to fall back to Ethernet
+        // or a Wi-Fi hotspot is also a network change that needs a reconnect.
         val networkRequest = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
             .build()
 
         try {
@@ -178,49 +233,94 @@ class NetworkDiscovery @Inject constructor(
         }
     }
 
+    /** Reads the current SSID on platforms where the network callback does not supply it. */
+    private fun refreshWifiSsid() {
+        try {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val connectionInfo = wifiManager.connectionInfo
+            if (connectionInfo.supplicantState == SupplicantState.COMPLETED) {
+                updateWifiSsid(connectionInfo.ssid)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to read current SSID: ${e.message}")
+        }
+    }
+
     private val networkCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         object : ConnectivityManager.NetworkCallback(FLAG_INCLUDE_LOCATION_INFO) {
             override fun onCapabilitiesChanged(
                 network: Network,
                 networkCapabilities: NetworkCapabilities,
             ) {
+                markAvailable(network)
                 val wifiInfo = networkCapabilities.transportInfo as? WifiInfo
                 deviceDiscoveryCallback(wifiInfo)
             }
 
             override fun onLost(network: Network) {
-                Log.d(TAG, "Network Lost")
-                _currentWifiSsid.value = null
-                stopDiscovery()
+                handleNetworkLost(network)
             }
         }
     } else {
         object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                Log.d(TAG, "Network callback Received")
-                val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-                val wifiInfo = wifiManager.connectionInfo
-                deviceDiscoveryCallback(wifiInfo)
+                markAvailable(network)
+                deviceDiscoveryCallback(readWifiInfo())
             }
 
             override fun onLost(network: Network) {
-                Log.d(TAG, "Network Lost")
-                _currentWifiSsid.value = null
-                stopDiscovery()
+                handleNetworkLost(network)
             }
         }
     }
 
-    // Passive wifi discovery callback: proceeds to start the udp listener if we are connected to a known wifi network
+    private fun markAvailable(network: Network) {
+        synchronized(activeNetworks) { activeNetworks += network }
+    }
+
+    /**
+     * Only tears discovery down once *no* local network is left.
+     *
+     * When roaming between Wi-Fi networks the platform delivers the new network's callback before
+     * the old one's `onLost`. Stopping on every `onLost` would therefore shut down the discovery
+     * that the new network had just started.
+     */
+    private fun handleNetworkLost(network: Network) {
+        val remaining = synchronized(activeNetworks) {
+            activeNetworks -= network
+            activeNetworks.size
+        }
+        Log.d(TAG, "Network lost, $remaining local network(s) remaining")
+        if (remaining == 0) {
+            _currentWifiSsid.value = null
+            stopDiscovery()
+        }
+    }
+
+    private fun readWifiInfo(): WifiInfo? = try {
+        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        wifiManager.connectionInfo
+    } catch (e: Exception) {
+        null
+    }
+
+    // Passive wifi discovery callback: rebuild discovery on the new interface, but only where the
+    // trust policy allows it.
     private fun deviceDiscoveryCallback(wifiInfo: WifiInfo?) {
         scope.launch {
-            if (wifiInfo != null && wifiInfo.ssid != UNKNOWN_SSID && wifiInfo.networkId != -1) {
-                updateWifiSsid(wifiInfo.ssid)
-                _currentWifiSsid.value?.let { ssid ->
-                    appRepository.getNetwork(ssid)?.let {  startDiscovery() } ?: stopDiscovery()
+            try {
+                if (wifiInfo != null && wifiInfo.ssid != UNKNOWN_SSID && wifiInfo.networkId != -1) {
+                    updateWifiSsid(wifiInfo.ssid)
                 }
-            } else {
-                _currentWifiSsid.value = null
+
+                val allowed = applyTrustPolicy(startIfAllowed = false)
+                if (allowed) {
+                    // The interface changed underneath us; rebuild every discovery primitive and
+                    // announce immediately so the peer can react instead of waiting for a tick.
+                    restartDiscovery()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error handling network change", e)
             }
         }
     }
@@ -233,39 +333,29 @@ class NetworkDiscovery @Inject constructor(
                     val attributes = serviceInfo.attributes
                     if (attributes != null) {
                         val deviceId = serviceInfo.serviceName
-                        val port = attributes["serverPort"]?.let { String(it, Charsets.UTF_8).toIntOrNull() }
+                        val port = attributes["serverPort"]
+                            ?.let { String(it, Charsets.UTF_8).toIntOrNull() }
+                            ?: serviceInfo.port
 
                         val addresses = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
                             SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU) >= 7
                         ) {
-                            serviceInfo.hostAddresses.map { it.hostAddress ?: "" }
-                                .filter { it.isNotBlank() && !it.contains(":") }
+                            serviceInfo.hostAddresses.mapNotNull { it.hostAddress }
                         } else {
                             listOfNotNull(serviceInfo.host?.hostAddress)
-                                .filter { !it.contains(":") }
-                        }
+                        }.mapNotNull { AddressUtils.normalizeAddress(it) }
 
-                        if (port == null || addresses.isEmpty()) return@forEach
+                        if (port <= 0 || addresses.isEmpty()) return@forEach
 
                         when (val device = deviceManager.getDevice(deviceId)) {
                             is PairedDevice -> {
-                                if (device.connectionState.isConnectedOrConnecting || device.connectionState.isForcedDisconnect) return@forEach
+                                if (device.connectionState.isConnectedOrConnecting) return@forEach
 
-                                // Merge discovered IPs with existing entries
-                                val existingAddresses = device.addresses.map { it.address }.toSet()
-                                val newEntries = addresses
-                                    .filter { it !in existingAddresses }
-                                    .map { AddressEntry(it) }
-                                val mergedAddresses = device.addresses + newEntries
-                                
-                                val updatedDevice = if (newEntries.isNotEmpty() || device.port != port) {
-                                    device.copy(
-                                        addresses = mergedAddresses,
-                                        port = port
-                                    )
-                                } else {
-                                    device
-                                }
+                                val updatedAddresses = AddressUtils.merge(device.addresses, addresses)
+                                val updatedDevice = device.copy(
+                                    addresses = updatedAddresses,
+                                    port = port,
+                                )
                                 networkManager.connectPaired(updatedDevice)
                             }
                             is DiscoveredDevice -> return@forEach
@@ -275,18 +365,23 @@ class NetworkDiscovery @Inject constructor(
                             }
                         }
                     }
-                }
-                catch (e: Exception) {
+                } catch (e: Exception) {
                     Log.e(TAG, "Error processing service info", e)
                 }
             }
         }
-
     }
 
-    fun broadcastDevice() {
+    /**
+     * Announces this device over UDP.
+     *
+     * Sent to the limited broadcast address *and* to every local subnet's directed broadcast,
+     * because 255.255.255.255 follows the default route which is not necessarily the LAN the peer
+     * is on. Previously known peer addresses are included for good measure.
+     */
+    fun broadcastDevice(force: Boolean = false) {
         val currentTime = System.currentTimeMillis()
-        if (currentTime - lastBroadcastTime < BROADCAST_RATE_LIMIT_MS) return
+        if (!force && currentTime - lastBroadcastTime < BROADCAST_RATE_LIMIT_MS) return
 
         lastBroadcastTime = currentTime
 
@@ -296,13 +391,15 @@ class NetworkDiscovery @Inject constructor(
                     udpSocket = socketFactory.udpSocket(udpPort)
                 }
 
-                val broadcastList = deviceManager.pairedDevices.value
-                    .flatMap { device -> 
-                        device.addresses
-                            .filter { it.isEnabled }
-                            .map { it.address }
-                    }
-                    .distinct() + "255.255.255.255"
+                val subnetBroadcasts = runCatching { NetworkHelper.subnetBroadcastAddresses() }
+                    .getOrDefault(emptyList())
+
+                val broadcastList = (
+                    deviceManager.pairedDevices.value
+                        .flatMap { device -> device.addresses.filter { it.isEnabled }.map { it.address } } +
+                        subnetBroadcasts +
+                        LIMITED_BROADCAST
+                    ).distinct()
 
                 broadcastList.forEach { hostname ->
                     try {
@@ -319,54 +416,66 @@ class NetworkDiscovery @Inject constructor(
         }
     }
 
-
+    /**
+     * Listens for announcements. Kept alive across socket replacement: a network change closes the
+     * bound socket, and without this the listener coroutine would die with it.
+     */
     private suspend fun startDeviceListener() {
         Log.d(TAG, "Device listener started")
-        try {
-            while (currentCoroutineContext().isActive) {
-                val datagram = udpSocket!!.receive()
-                val udpBroadcast = datagram.packet.readLine()?.let {
-                    MessageSerializer.deserialize(it) as UdpBroadcast
-                } ?: continue
+        var lastErrorLog = 0L
 
-                if (udpBroadcast.deviceId == deviceManager.localDevice.deviceId) continue
-                Log.d(TAG, "Received UDP broadcast from ${udpBroadcast.deviceName}")
-                when (val device = deviceManager.getDevice(udpBroadcast.deviceId)) {
-                    is PairedDevice -> {
-                         if (device.connectionState.isConnectedOrConnecting || device.connectionState.isForcedDisconnect) continue
-
-                        // Update IP addresses if new ones are found
-                        val senderIp = datagram.address.toString()
-                        val existingAddresses = device.addresses.map { it.address }.toSet()
-                        if (!existingAddresses.contains(senderIp)) {
-                            try {
-                                val updatedAddresses = device.addresses + AddressEntry(senderIp)
-                                appRepository.updateDeviceAddresses(device.deviceId, updatedAddresses)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Failed to update IP addresses in database", e)
-                            }
-                        }
-
-                         // Update device with discovered port if it differs
-                         val updatedDevice = if (device.port != udpBroadcast.port) {
-                             device.copy(port = udpBroadcast.port)
-                         } else {
-                             device
-                         }
-                         networkManager.connectPaired(updatedDevice)
-                    }
-                    null -> {
-                        // New device
-                        val senderIp = datagram.address.toString()
-                        val connectionDetails = ConnectionDetails(udpBroadcast.deviceId, udpBroadcast.port, listOf(senderIp))
-                        networkManager.connectTo(connectionDetails)
-                    }
-                }
+        while (currentCoroutineContext().isActive) {
+            val socket = udpSocket
+            if (socket == null || socket.isClosed) {
+                delay(SOCKET_RETRY_DELAY_MS)
+                continue
             }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            Log.e(TAG, "Error in device listener on port $udpPort", e)
+
+            try {
+                handleDatagram(socket.receive())
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (!currentCoroutineContext().isActive) break
+                val now = System.currentTimeMillis()
+                if (now - lastErrorLog > ERROR_LOG_INTERVAL_MS) {
+                    lastErrorLog = now
+                    Log.e(TAG, "Error receiving on port $udpPort: ${e.message}", e)
+                }
+                delay(SOCKET_RETRY_DELAY_MS)
+            }
+        }
+    }
+
+    private suspend fun handleDatagram(datagram: Datagram) {
+        val udpBroadcast = datagram.packet.readLine()?.let {
+            MessageSerializer.deserialize(it) as? UdpBroadcast
+        } ?: return
+
+        if (udpBroadcast.deviceId == deviceManager.localDevice.deviceId) return
+        Log.d(TAG, "Received UDP broadcast from ${udpBroadcast.deviceName}")
+
+        val senderIp = NetworkHelper.senderAddress(datagram.address)
+        if (senderIp == null) {
+            Log.w(TAG, "Announcement from ${udpBroadcast.deviceName} has no usable IPv4 source address")
+            return
+        }
+
+        when (val device = deviceManager.getDevice(udpBroadcast.deviceId)) {
+            is PairedDevice -> {
+                if (device.connectionState.isConnectedOrConnecting) return
+
+                val updatedDevice = device.copy(
+                    addresses = AddressUtils.merge(device.addresses, listOf(senderIp)),
+                    port = udpBroadcast.port,
+                )
+                networkManager.connectPaired(updatedDevice)
+            }
+            null -> {
+                val connectionDetails =
+                    ConnectionDetails(udpBroadcast.deviceId, udpBroadcast.port, listOf(senderIp))
+                networkManager.connectTo(connectionDetails)
+            }
         }
     }
 
@@ -390,5 +499,10 @@ class NetworkDiscovery @Inject constructor(
         private const val TAG = "NetworkDiscovery"
         private const val UNKNOWN_SSID = "<unknown ssid>"
         private const val BROADCAST_RATE_LIMIT_MS = 200L
+        private const val LIMITED_BROADCAST = "255.255.255.255"
+        private const val REDISCOVERY_INTERVAL_MS = 20_000L
+        private const val NETWORK_CHANGE_SETTLE_MS = 500L
+        private const val SOCKET_RETRY_DELAY_MS = 250L
+        private const val ERROR_LOG_INTERVAL_MS = 5_000L
     }
 }

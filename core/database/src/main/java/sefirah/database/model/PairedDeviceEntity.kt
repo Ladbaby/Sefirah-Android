@@ -13,6 +13,12 @@ data class PairedDeviceEntity (
     val certificate: ByteArray,
     val avatar: String? = null,
     var lastConnected: Long? = null,
+    /**
+     * TCP port the peer last advertised. Persisted because the peer picks its port from a range at
+     * startup; falling back to a hardcoded default after a restart sends every cached-IP reconnect
+     * to the wrong port.
+     */
+    val port: Int? = null,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -21,6 +27,7 @@ data class PairedDeviceEntity (
         other as PairedDeviceEntity
 
         if (lastConnected != other.lastConnected) return false
+        if (port != other.port) return false
         if (deviceId != other.deviceId) return false
         if (addresses != other.addresses) return false
         if (deviceName != other.deviceName) return false
@@ -32,6 +39,7 @@ data class PairedDeviceEntity (
 
     override fun hashCode(): Int {
         var result = lastConnected?.hashCode() ?: 0
+        result = 31 * result + (port ?: 0)
         result = 31 * result + deviceId.hashCode()
         result = 31 * result + addresses.hashCode()
         result = 31 * result + deviceName.hashCode()
@@ -42,7 +50,15 @@ data class PairedDeviceEntity (
 }
 
 fun PairedDeviceEntity.toDomain(): PairedDevice {
-    return PairedDevice(deviceId, deviceName, certificate, addresses, avatar, lastConnected)
+    return PairedDevice(
+        deviceId = deviceId,
+        deviceName = deviceName,
+        certificate = certificate,
+        addresses = addresses,
+        avatar = avatar,
+        lastConnected = lastConnected,
+        port = port,
+    )
 }
 
 fun List<PairedDeviceEntity>.toDomain(): List<PairedDevice> {
@@ -50,5 +66,13 @@ fun List<PairedDeviceEntity>.toDomain(): List<PairedDevice> {
 }
 
 fun PairedDevice.toEntity(): PairedDeviceEntity {
-    return PairedDeviceEntity(deviceId, deviceName, addresses, certificate, avatar, lastConnected)
+    return PairedDeviceEntity(
+        deviceId = deviceId,
+        deviceName = deviceName,
+        addresses = addresses,
+        certificate = certificate,
+        avatar = avatar,
+        lastConnected = lastConnected,
+        port = port,
+    )
 }

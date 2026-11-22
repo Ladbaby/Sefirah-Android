@@ -1,5 +1,7 @@
 package sefirah.domain.model
 
+import sefirah.domain.util.AddressUtils
+
 data class PairedDevice(
     override val deviceId: String,
     override val deviceName: String,
@@ -11,15 +13,29 @@ data class PairedDevice(
     val port: Int? = null,
     val connectionState: ConnectionState = ConnectionState.Disconnected(),
 ) : BaseRemoteDevice() {
-    
-    /** Returns enabled addresses sorted by priority, or all addresses if none enabled */
-    fun getAddressesToTry(): List<String> {
+
+    /**
+     * Returns the addresses to attempt, most likely first.
+     *
+     * Ordering matters more than it looks: the desktop advertises one IP per adapter, and the phone
+     * accumulates one IP per subnet it has ever joined. Trying them in insertion order means every
+     * reconnect starts with the oldest, deadest entry and can burn the whole attempt budget there.
+     *
+     * When the user has explicitly enabled addresses we honour their order and nothing else.
+     * Otherwise we rank by usefulness: same subnet as this device first, then user priority, then
+     * most recently observed.
+     *
+     * @param localAddresses this device's own IPs, used to detect a shared subnet.
+     */
+    fun getAddressesToTry(localAddresses: Collection<String> = emptyList()): List<String> {
         val enabled = addresses.filter { it.isEnabled }.sortedBy { it.priority }
-        return if (enabled.isNotEmpty()) {
-            enabled.map { it.address }
-        } else {
-            addresses.sortedBy { it.priority }.map { it.address }
-        }
+        if (enabled.isNotEmpty()) return enabled.map { it.address }
+
+        return addresses.sortedWith(
+            compareByDescending<AddressEntry> { AddressUtils.isLikelyReachable(it.address, localAddresses) }
+                .thenBy { it.priority }
+                .thenByDescending { it.lastSeen }
+        ).map { it.address }
     }
 
     override fun equals(other: Any?): Boolean = when {

@@ -32,26 +32,19 @@ class NsdService @Inject constructor(val context: Context) {
     private var registrationListener: NsdManager.RegistrationListener? = null
     private var currentServiceID: String? = null
 
-    private var multicastLock: WifiManager.MulticastLock
-    private val executor = Executors.newSingleThreadExecutor()
+    /** Resolved services, keyed by instance name. Instance names are the peer device ids. */
+    private val resolvedServices = mutableMapOf<String, NsdServiceInfo>()
 
-    init {
-        try {
-            val wifiManager = context.applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
-            multicastLock = wifiManager.createMulticastLock("SefirahMulticastLock")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error acquiring multicast lock", e)
-            throw e
-        }
-    }
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private val executor = Executors.newSingleThreadExecutor()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     fun startDiscovery() {
         try {
             if (discoveryListener != null) return
 
-            Log.d(TAG, "Starting mDns discovery")
-            multicastLock.acquire()
-            _services.value = emptyList()
+            Log.d(TAG, "Starting mDNS discovery")
+            acquireMulticastLock()
             discoveryListener = createDiscoveryListener()
             nsdManager.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
         } catch (e: Exception) {
@@ -61,10 +54,10 @@ class NsdService @Inject constructor(val context: Context) {
 
     fun stopDiscovery() {
         try {
-            if (discoveryListener == null) return
+            val listener = discoveryListener ?: return
 
-            nsdManager.stopServiceDiscovery(discoveryListener)
-            multicastLock.release()
+            nsdManager.stopServiceDiscovery(listener)
+            releaseMulticastLock()
             discoveryListener = null
             Log.d(TAG, "Stopped service discovery")
         } catch (e: Exception) {
@@ -72,12 +65,35 @@ class NsdService @Inject constructor(val context: Context) {
         }
     }
 
+    /**
+     * Restarts the discovery subscription, keeping the resolved cache so already-known peers are
+     * not re-resolved from scratch.
+     *
+     * The platform NSD daemon does not survive every interface change: the subscription can become
+     * permanently silent while still reporting itself as active. The only recovery is to drop the
+     * listener and register a new one.
+     */
+    fun restartDiscovery() {
+        try {
+            val listener = discoveryListener
+            if (listener != null) {
+                runCatching { nsdManager.stopServiceDiscovery(listener) }
+                    .onFailure { Log.w(TAG, "stopServiceDiscovery during restart failed: ${it.message}") }
+                releaseMulticastLock()
+                discoveryListener = null
+            }
+            startDiscovery()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error restarting discovery: ${e.message}", e)
+        }
+    }
+
     fun advertiseService(broadcast: UdpBroadcast, port: Int) {
-        try {            
+        try {
             if (registrationListener != null) {
                 stopAdvertisingService()
             }
-            
+
             currentServiceID = broadcast.deviceId
 
             val serviceInfo = NsdServiceInfo().also {
@@ -86,6 +102,7 @@ class NsdService @Inject constructor(val context: Context) {
                 it.port = port
             }
             serviceInfo.setAttribute("deviceName", broadcast.deviceName)
+            serviceInfo.setAttribute("serverPort", port.toString())
 
             registrationListener = createRegistrationListener()
             nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener)
@@ -104,7 +121,37 @@ class NsdService @Inject constructor(val context: Context) {
         registrationListener = null
     }
 
-    private fun createRegistrationListener() : NsdManager.RegistrationListener {
+    private fun acquireMulticastLock() {
+        try {
+            val wifiManager = context.applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
+            val lock = multicastLock ?: wifiManager
+                .createMulticastLock("SefirahMulticastLock")
+                .also { multicastLock = it }
+            if (!lock.isHeld) lock.acquire()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error acquiring multicast lock", e)
+        }
+    }
+
+    private fun releaseMulticastLock() {
+        try {
+            multicastLock?.takeIf { it.isHeld }?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error releasing multicast lock", e)
+        }
+    }
+
+    private fun publish(serviceInfo: NsdServiceInfo) {
+        resolvedServices[serviceInfo.serviceName] = serviceInfo
+        _services.value = resolvedServices.values.toList()
+    }
+
+    private fun remove(serviceName: String) {
+        resolvedServices.remove(serviceName)
+        _services.value = resolvedServices.values.toList()
+    }
+
+    private fun createRegistrationListener(): NsdManager.RegistrationListener {
         return object : NsdManager.RegistrationListener {
             override fun onRegistrationFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
                 Log.e(TAG, "Service registration failed: Error code: $errorCode")
@@ -124,7 +171,7 @@ class NsdService @Inject constructor(val context: Context) {
         }
     }
 
-    private fun createDiscoveryListener() : NsdManager.DiscoveryListener{
+    private fun createDiscoveryListener(): NsdManager.DiscoveryListener {
         return object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(regType: String) {
                 Log.i(TAG, "Service discovery started")
@@ -135,44 +182,14 @@ class NsdService @Inject constructor(val context: Context) {
                 if (service.serviceName == currentServiceID) return
 
                 Log.d(TAG, "Service found: $service")
-                if (service.serviceType == SERVICE_TYPE) {
-                    try {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
-                            && SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU) >= 7) {
-                            // Unregister previous ServiceInfoCallback if registered
-                            try {
-                                nsdManager.unregisterServiceInfoCallback(serviceInfoCallback)
-                                Log.d(TAG, "Successfully unregistered previous ServiceInfoCallback")
-                            } catch (e: Exception) {
-                                Log.e(TAG, "No ServiceInfoCallback was registered: ${e.message}")
-                            }
+                if (!service.serviceType.startsWith(SERVICE_TYPE_NO_DOT)) return
 
-                            // Add a small delay to avoid race conditions
-                            Handler(Looper.getMainLooper()).postDelayed({
-                                try {
-                                    nsdManager.registerServiceInfoCallback(service, executor, serviceInfoCallback)
-                                    Log.d(TAG, "Successfully registered ServiceInfoCallback")
-                                } catch (e: IllegalArgumentException) {
-                                    Log.e(TAG, "Listener already in use or issue in registration: ${e.message}")
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Error registering listener: ${e.message}")
-                                }
-                            }, 500)
-                        } else {
-                            val resolveListener = createResolveListener()
-                            nsdManager.resolveService(service, resolveListener)
-                        }
-                    } catch (e: IllegalArgumentException) {
-                        Log.e(TAG, "Listener already in use or issue in registration: ${e.message}")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error registering listener: ${e.message}")
-                    }
-                }
+                resolve(service)
             }
 
             override fun onServiceLost(service: NsdServiceInfo) {
-                Log.e(TAG, "Service lost: $service")
-                _services.value = _services.value.filter { it.serviceName != service.serviceName }
+                Log.d(TAG, "Service lost: $service")
+                remove(service.serviceName)
             }
 
             override fun onDiscoveryStopped(serviceType: String) {
@@ -181,10 +198,38 @@ class NsdService @Inject constructor(val context: Context) {
 
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.e(TAG, "Discovery failed to start: Error code: $errorCode")
+                // A failed start leaves the listener registered but dead; clear it so the next
+                // restart actually tries again.
+                discoveryListener = null
+                releaseMulticastLock()
             }
 
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.e(TAG, "Discovery failed to stop: Error code: $errorCode")
+            }
+        }
+    }
+
+    private fun resolve(service: NsdServiceInfo) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
+            SdkExtensions.getExtensionVersion(Build.VERSION_CODES.TIRAMISU) >= 7
+        ) {
+            // The callback API reuses a single registered callback, so it has to be unregistered
+            // before the next service can be registered. Same 500ms grace period the platform
+            // needs between unregister and register on the same NsdManager.
+            runCatching { nsdManager.unregisterServiceInfoCallback(serviceInfoCallback) }
+            mainHandler.postDelayed({
+                try {
+                    nsdManager.registerServiceInfoCallback(service, executor, serviceInfoCallback)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error registering ServiceInfoCallback: ${e.message}")
+                }
+            }, RESOLVE_DELAY_MS)
+        } else {
+            try {
+                nsdManager.resolveService(service, createResolveListener())
+            } catch (e: Exception) {
+                Log.e(TAG, "Error resolving service: ${e.message}")
             }
         }
     }
@@ -196,11 +241,15 @@ class NsdService @Inject constructor(val context: Context) {
         return object : NsdManager.ResolveListener {
             override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
                 Log.w(TAG, "MDNS Resolve failed: Error code: $errorCode")
+                // Resolution failure often means the queue is backed up; retry shortly.
+                if (errorCode == NsdManager.FAILURE_ALREADY_ACTIVE) {
+                    mainHandler.postDelayed({ resolve(serviceInfo) }, RESOLVE_DELAY_MS)
+                }
             }
 
             override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
                 Log.i(TAG, "MDNS Resolved successfully $serviceInfo")
-                _services.value = (_services.value + serviceInfo).distinctBy { it.serviceName }
+                publish(serviceInfo)
             }
         }
     }
@@ -217,19 +266,13 @@ class NsdService @Inject constructor(val context: Context) {
 
             override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
                 Log.d(TAG, "Service updated: $serviceInfo")
-                currentMonitoredService = serviceInfo  // Store the current service
-                try {
-                    _services.value = (_services.value + serviceInfo).distinctBy { it.serviceName }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to parse service info: ${e.message}")
-                }
+                currentMonitoredService = serviceInfo
+                publish(serviceInfo)
             }
 
             override fun onServiceLost() {
-                Log.e(TAG, "Service lost")
-                currentMonitoredService?.let { lostService ->
-                    _services.value = _services.value.filter { it.serviceName != lostService.serviceName }
-                }
+                Log.d(TAG, "Service lost")
+                currentMonitoredService?.let { remove(it.serviceName) }
             }
 
             override fun onServiceInfoCallbackUnregistered() {
@@ -242,6 +285,7 @@ class NsdService @Inject constructor(val context: Context) {
     companion object {
         private const val TAG = "NsdService"
         private const val SERVICE_TYPE = "_sefirah._udp."
+        private const val SERVICE_TYPE_NO_DOT = "_sefirah._udp"
+        private const val RESOLVE_DELAY_MS = 500L
     }
 }
-

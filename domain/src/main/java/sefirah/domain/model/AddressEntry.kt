@@ -9,6 +9,7 @@ import kotlinx.serialization.Serializable
 data class AddressEntry(
     val address: String,
     val isEnabled: Boolean = false,
-    val priority: Int = 0
+    val priority: Int = 0,
+    /** Wall clock time this address was last observed to be reachable, 0 if never. */
+    val lastSeen: Long = 0L,
 ) : Parcelable
-

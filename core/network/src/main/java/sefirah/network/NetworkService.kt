@@ -21,13 +21,18 @@ import io.ktor.utils.io.jvm.javaio.toByteReadChannel
 import io.ktor.utils.io.readUTF8Line
 import io.ktor.utils.io.streams.asByteWriteChannel
 import io.ktor.utils.io.writeStringUtf8
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import sefirah.FeatureManager
@@ -60,6 +65,7 @@ import sefirah.domain.model.PairMessage
 import sefirah.domain.model.PairedDevice
 import sefirah.domain.model.PendingDeviceApproval
 import sefirah.domain.model.SocketMessage
+import sefirah.domain.util.AddressUtils
 import sefirah.domain.util.MessageSerializer
 import sefirah.media.PlaybackFeature
 import sefirah.media.RemotePlaybackFeature
@@ -68,6 +74,7 @@ import sefirah.network.extensions.handleMessage
 import sefirah.network.extensions.startForegroundNotification
 import sefirah.network.extensions.updateNotification
 import sefirah.network.extensions.showPairingVerificationNotification
+import sefirah.network.util.NetworkHelper
 import sefirah.network.util.SslHelper
 import sefirah.notification.NotificationFeature
 import sefirah.playsound.PlaySoundFeature
@@ -145,6 +152,9 @@ class NetworkService : Service() {
     private var serverAcceptJob: Job? = null
 
     private val connections = mutableMapOf<String, DeviceConnection>()
+
+    /** Serialises connection attempts per device so overlapping triggers cannot race. */
+    private val connectionMutexes = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
 
     private var tcpServerPort by Delegates.notNull<Int>()
 
@@ -378,11 +388,7 @@ class NetworkService : Service() {
         val updatedDevice = device.copy(
             deviceName = authMessage.deviceName,
             lastConnected = System.currentTimeMillis(),
-            addresses = if (device.addresses.none { it.address == address }) {
-                device.addresses + AddressEntry(address)
-            } else {
-                device.addresses
-            },
+            addresses = AddressUtils.merge(device.addresses, listOfNotNull(address)),
             address = address,
             connectionState = ConnectionState.Connected,
         )
@@ -425,44 +431,75 @@ class NetworkService : Service() {
     }
 
     suspend fun connectPaired(device: PairedDevice) {
-        deviceManager.addOrUpdatePairedDevice(device.copy(connectionState = ConnectionState.Connecting(device.deviceId)))
-
-        val port = device.port ?: PORT_RANGE.first
-
-        try {
-            val sslSocket = run {
-                for (ip in device.getAddressesToTry()) {
-                    socketFactory.tcpClientSocket(ip, port, device.certificate)?.let { return@run it }
-                }
-                null
-            } ?: run {
-                Log.e(TAG, "All connection attempts failed")
-                deviceManager.addOrUpdatePairedDevice(device.copy(connectionState = ConnectionState.Disconnected()))
+        // A reconnect fires from discovery, the UI, the tile and notification actions, often at the
+        // same time. Serialise per device so two attempts cannot race and tear down each other's
+        // socket, and so a stale attempt cannot overwrite a fresh Connected state.
+        val mutex = connectionMutexes.getOrPut(device.deviceId) { Mutex() }
+        mutex.withLock {
+            val current = deviceManager.getPairedDevice(device.deviceId) ?: device
+            if (current.connectionState.isConnected) {
+                Log.d(TAG, "Already connected to ${device.deviceId}, skipping reconnect")
                 return
             }
 
-            val readChannel = sslSocket.inputStream.toByteReadChannel()
-            val writeChannel = sslSocket.outputStream.asByteWriteChannel()
-
-            sendAuthMessage(writeChannel)
-
-            val connection = DeviceConnection(device.deviceId, sslSocket, readChannel, writeChannel)
-            setConnection(device.deviceId, connection)
-
-            val remoteAddress = (sslSocket.remoteSocketAddress as? java.net.InetSocketAddress)?.address?.hostAddress ?: ""
-            val updatedDevice = device.copy(
-                lastConnected = System.currentTimeMillis(),
-                connectionState = ConnectionState.Connected,
-                port = port,
-                address = remoteAddress
+            deviceManager.addOrUpdatePairedDevice(
+                current.copy(connectionState = ConnectionState.Connecting(current.deviceId))
             )
-            deviceManager.addOrUpdatePairedDevice(updatedDevice)
 
-            Log.d(TAG, "Device ${updatedDevice.deviceId} connected")
-            finalizeConnection(updatedDevice, false)
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during connection", e)
-            deviceManager.addOrUpdatePairedDevice(device.copy(connectionState = ConnectionState.Disconnected()))
+            val port = current.port ?: PORT_RANGE.first
+            val candidates = current.getAddressesToTry(NetworkHelper.localAddresses)
+            if (candidates.isEmpty()) {
+                Log.w(TAG, "No known addresses for ${current.deviceId}; waiting for discovery")
+                deviceManager.addOrUpdatePairedDevice(
+                    current.copy(connectionState = ConnectionState.Disconnected())
+                )
+                return
+            }
+
+            try {
+                val sslSocket = run {
+                    for (ip in candidates) {
+                        socketFactory.tcpClientSocket(ip, port, current.certificate)?.let { return@run it }
+                        if (!currentCoroutineContext().isActive) return
+                    }
+                    null
+                } ?: run {
+                    Log.e(TAG, "All connection attempts failed")
+                    deviceManager.addOrUpdatePairedDevice(
+                        current.copy(connectionState = ConnectionState.Disconnected())
+                    )
+                    return
+                }
+
+                val readChannel = sslSocket.inputStream.toByteReadChannel()
+                val writeChannel = sslSocket.outputStream.asByteWriteChannel()
+
+                sendAuthMessage(writeChannel)
+
+                val connection = DeviceConnection(current.deviceId, sslSocket, readChannel, writeChannel)
+                setConnection(current.deviceId, connection)
+
+                val remoteAddress =
+                    (sslSocket.remoteSocketAddress as? java.net.InetSocketAddress)?.address?.hostAddress ?: ""
+                val updatedDevice = current.copy(
+                    lastConnected = System.currentTimeMillis(),
+                    connectionState = ConnectionState.Connected,
+                    port = port,
+                    address = remoteAddress,
+                    addresses = AddressUtils.merge(current.addresses, listOfNotNull(remoteAddress)),
+                )
+                deviceManager.addOrUpdatePairedDevice(updatedDevice)
+
+                Log.d(TAG, "Device ${updatedDevice.deviceId} connected")
+                finalizeConnection(updatedDevice, false)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during connection", e)
+                deviceManager.addOrUpdatePairedDevice(
+                    current.copy(connectionState = ConnectionState.Disconnected())
+                )
+            }
         }
     }
 

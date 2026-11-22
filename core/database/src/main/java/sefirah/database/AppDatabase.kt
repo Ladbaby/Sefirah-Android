@@ -5,7 +5,9 @@ import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.TypeConverters
+import androidx.room.migration.Migration
 import androidx.room.withTransaction
+import androidx.sqlite.db.SupportSQLiteDatabase
 import sefirah.database.dao.DeviceDao
 import sefirah.database.dao.NetworkDao
 import sefirah.database.model.LocalDeviceEntity
@@ -23,9 +25,17 @@ interface AppDatabase {
 
     companion object {
         private const val DATABASE_NAME = "sefirah.db"
-        
+
+        /** Persists the peer's TCP port so cached-IP reconnects do not fall back to a default. */
+        internal val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE PairedDeviceEntity ADD COLUMN port INTEGER")
+            }
+        }
+
         fun createRoom(context: Context): AppDatabase = Room
             .databaseBuilder(context, AppRoomDatabase::class.java, DATABASE_NAME)
+            .addMigrations(MIGRATION_2_3)
             .fallbackToDestructiveMigration(false)
             .build()
     }
@@ -37,7 +47,7 @@ interface AppDatabase {
         NetworkEntity::class,
         LocalDeviceEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
