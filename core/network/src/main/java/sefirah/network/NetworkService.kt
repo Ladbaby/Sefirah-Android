@@ -460,7 +460,9 @@ class NetworkService : Service() {
                 val sslSocket = run {
                     for (ip in candidates) {
                         socketFactory.tcpClientSocket(ip, port, current.certificate)?.let { return@run it }
-                        if (!currentCoroutineContext().isActive) return
+                        // Bail out of the loop but fall through to the failure branch so the
+                        // state is reset; returning here would strand it at Connecting.
+                        if (!currentCoroutineContext().isActive) return@run null
                     }
                     null
                 } ?: run {
@@ -493,16 +495,34 @@ class NetworkService : Service() {
                 Log.d(TAG, "Device ${updatedDevice.deviceId} connected")
                 finalizeConnection(updatedDevice, false)
             } catch (e: CancellationException) {
+                // The attempt was torn down before it could finish. Leaving the state at Connecting
+                // would make isConnectedOrConnecting true forever, which blocks every later retry
+                // from discovery, the UI and the tile, so reset it before propagating. Only clear it
+                // if we are still the attempt that owns the Connecting state: a concurrent inbound
+                // connection may have legitimately marked this device Connected in the meantime.
+                resetIfStillConnecting(current)
                 throw e
             } catch (e: Exception) {
                 Log.e(TAG, "Error during connection", e)
-                deviceManager.addOrUpdatePairedDevice(
-                    current.copy(connectionState = ConnectionState.Disconnected())
-                )
+                resetIfStillConnecting(current)
             }
         }
     }
 
+
+    /**
+     * Clears a stuck Connecting state left behind by a failed or cancelled attempt.
+     * Does nothing if the device is already Connected, since an inbound connection may have
+     * completed concurrently.
+     */
+    private suspend fun resetIfStillConnecting(snapshot: PairedDevice) {
+        val live = deviceManager.getPairedDevice(snapshot.deviceId) ?: return
+        if (live.connectionState.isConnected) return
+
+        deviceManager.addOrUpdatePairedDevice(
+            live.copy(connectionState = ConnectionState.Disconnected())
+        )
+    }
 
     suspend fun connectTo(connectionDetails: ConnectionDetails) {
         removeConnection(connectionDetails.deviceId)

@@ -193,6 +193,36 @@ class NetworkDiscovery @Inject constructor(
                 Log.d(TAG, "Periodic rediscovery tick")
                 broadcastDevice(force = true)
                 nsdService.restartDiscovery()
+
+                // Re-announcing is not enough on its own: the desktop only broadcasts once at
+                // startup, and its mDNS record is often still cached, so neither peer re-sends
+                // anything after a drop. Without this the app sits at Disconnected forever even
+                // though both ends are reachable. Forced disconnects are user intent, so skip them.
+                retryDisconnectedPairedDevices()
+            }
+        }
+    }
+
+    /**
+     * Actively re-dials paired devices that dropped and are not deliberately disconnected.
+     *
+     * connectPaired is serialised per device and no-ops when already connected, so calling it
+     * from this tick cannot race an in-flight attempt.
+     */
+    private suspend fun retryDisconnectedPairedDevices() {
+        val candidates = deviceManager.pairedDevices.value.filter {
+            it.connectionState.isDisconnected && !it.connectionState.isForcedDisconnect
+        }
+        if (candidates.isEmpty()) return
+
+        Log.d(TAG, "Retrying ${candidates.size} disconnected paired device(s)")
+        candidates.forEach { device ->
+            try {
+                networkManager.connectPaired(device)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Retry failed for ${device.deviceId}", e)
             }
         }
     }
